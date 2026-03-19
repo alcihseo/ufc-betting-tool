@@ -36,48 +36,64 @@ async function scrapeTapologyPicks(page, url) {
     }
   } catch {}
 
-  const raw = await page.evaluate(() => {
-    const fights = [];
-    // Tapology event pages list fights in <li> elements inside a fight card section
-    const rows = document.querySelectorAll('ul.fightCard li, section.fightCard li, li[data-id]');
-    rows.forEach(row => {
-      // Fighter name links
-      const nameEls = row.querySelectorAll('[class*="fighter"] a[href*="/fighters/"], .fighter a');
-      // Pick percentage elements
-      const pctEls  = row.querySelectorAll('[class*="pick"] [class*="percent"], [class*="picks"] span, .communityPicks span');
+  // Click the Predictions tab to load pick data
+  try {
+    const predsTab = page.locator('text=Predictions').first();
+    if (await predsTab.isVisible({ timeout: 3000 })) {
+      await predsTab.click();
+      await page.waitForTimeout(2000);
+    }
+  } catch {}
 
-      if (nameEls.length >= 2) {
-        fights.push({
-          f1:   nameEls[0]?.innerText.trim(),
-          f2:   nameEls[1]?.innerText.trim(),
-          pct1: pctEls[0]?.innerText.trim() || null,
-          pct2: pctEls[1]?.innerText.trim() || null,
-        });
-      }
-    });
-    return fights;
-  });
+  const text = await page.evaluate(() => document.body.innerText);
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-  console.log(`Tapology: found ${raw.length} fights`);
-  raw.forEach(f => console.log(`  ${f.f1} (${f.pct1}) vs ${f.f2} (${f.pct2})`));
-
-  const picksMap = new Map();
-  for (const f of raw) {
-    if (f.f1 && f.pct1) picksMap.set(normName(f.f1), f.pct1);
-    if (f.f2 && f.pct2) picksMap.set(normName(f.f2), f.pct2);
+  // Find the predictions breakdown section
+  const startIdx = lines.findIndex(l => l.includes('current breakdown of event predictions'));
+  if (startIdx < 0) {
+    console.log('Tapology: predictions section not found');
+    return new Map();
   }
+
+  // Collect prediction lines, skipping table headers and stop at end marker
+  const SKIP = new Set(['KO/TKO', 'Submission', 'Decision']);
+  const predLines = [];
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.startsWith('Update /') || l.startsWith('Verify your')) break;
+    if (SKIP.has(l) || l === ' ') continue;
+    predLines.push(l);
+  }
+
+  // predLines alternates: name, pct%, name, pct%, ...
+  const picksMap = new Map();
+  for (let i = 0; i < predLines.length - 1; i++) {
+    const curr = predLines[i];
+    const next = predLines[i + 1];
+    if (!curr.match(/^\d+%$/) && next.match(/^\d+%$/)) {
+      picksMap.set(normName(curr), next);
+      i++; // skip the percentage line we just consumed
+    }
+  }
+
+  console.log(`Tapology: found picks for ${picksMap.size} fighters`);
+  for (const [name, pct] of picksMap) console.log(`  ${name}: ${pct}`);
+
   return picksMap;
 }
 
 // Look up a fighter's Tapology pick%, trying full name then last name fallback
+const NAME_SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv']);
 function lookupPick(picksMap, fullName) {
   if (!picksMap || picksMap.size === 0) return 'N/A';
   const norm = normName(fullName);
   if (picksMap.has(norm)) return picksMap.get(norm);
-  // Last-name fallback
-  const lastName = norm.split(' ').pop();
+  // Last-name fallback (strip suffixes like jr/sr first)
+  const parts = norm.split(' ').filter(p => !NAME_SUFFIXES.has(p));
+  const lastName = parts[parts.length - 1];
   for (const [key, val] of picksMap) {
-    if (key.endsWith(lastName)) return val;
+    const keyParts = key.split(' ').filter(p => !NAME_SUFFIXES.has(p));
+    if (keyParts[keyParts.length - 1] === lastName) return val;
   }
   return 'N/A';
 }
