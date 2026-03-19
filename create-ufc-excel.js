@@ -27,6 +27,15 @@ async function scrapeTapologyPicks(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(3000);
 
+  // Dismiss cookie consent if present
+  try {
+    const cookieBtn = page.locator('button:has-text("OK"), button:has-text("Accept"), button:has-text("I Agree"), button:has-text("Accept All")').first();
+    if (await cookieBtn.isVisible({ timeout: 2000 })) {
+      await cookieBtn.click();
+      await page.waitForTimeout(1000);
+    }
+  } catch {}
+
   const raw = await page.evaluate(() => {
     const fights = [];
     // Tapology event pages list fights in <li> elements inside a fight card section
