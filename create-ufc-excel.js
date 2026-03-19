@@ -3,11 +3,74 @@ const { chromium } = require('playwright');
 const { exec } = require('child_process');
 const fs = require('fs');
 
-const UFC_EVENT_URL = process.argv[2] || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
+const UFC_EVENT_URL      = process.argv[2] || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
+const TAPOLOGY_EVENT_URL = process.argv[3] || null;
 
 function eventUrlToSheetName(url) {
   const slug = url.split('/').pop(); // e.g. "ufc-fight-night-march-21-2026"
   return slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).slice(0, 31);
+}
+
+// Normalize a fighter name for loose matching (lowercase, letters/spaces only)
+function normName(name) {
+  return (name || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .replace(/[^a-z ]/g, '')
+    .trim();
+}
+
+// Scrape community pick % from a Tapology event page.
+// Returns a Map: normalized-fighter-name → pick% string (e.g. "65%")
+async function scrapeTapologyPicks(page, url) {
+  console.log('\nLoading Tapology event page...');
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(3000);
+
+  const raw = await page.evaluate(() => {
+    const fights = [];
+    // Tapology event pages list fights in <li> elements inside a fight card section
+    const rows = document.querySelectorAll('ul.fightCard li, section.fightCard li, li[data-id]');
+    rows.forEach(row => {
+      // Fighter name links
+      const nameEls = row.querySelectorAll('[class*="fighter"] a[href*="/fighters/"], .fighter a');
+      // Pick percentage elements
+      const pctEls  = row.querySelectorAll('[class*="pick"] [class*="percent"], [class*="picks"] span, .communityPicks span');
+
+      if (nameEls.length >= 2) {
+        fights.push({
+          f1:   nameEls[0]?.innerText.trim(),
+          f2:   nameEls[1]?.innerText.trim(),
+          pct1: pctEls[0]?.innerText.trim() || null,
+          pct2: pctEls[1]?.innerText.trim() || null,
+        });
+      }
+    });
+    return fights;
+  });
+
+  console.log(`Tapology: found ${raw.length} fights`);
+  raw.forEach(f => console.log(`  ${f.f1} (${f.pct1}) vs ${f.f2} (${f.pct2})`));
+
+  const picksMap = new Map();
+  for (const f of raw) {
+    if (f.f1 && f.pct1) picksMap.set(normName(f.f1), f.pct1);
+    if (f.f2 && f.pct2) picksMap.set(normName(f.f2), f.pct2);
+  }
+  return picksMap;
+}
+
+// Look up a fighter's Tapology pick%, trying full name then last name fallback
+function lookupPick(picksMap, fullName) {
+  if (!picksMap || picksMap.size === 0) return 'N/A';
+  const norm = normName(fullName);
+  if (picksMap.has(norm)) return picksMap.get(norm);
+  // Last-name fallback
+  const lastName = norm.split(' ').pop();
+  for (const [key, val] of picksMap) {
+    if (key.endsWith(lastName)) return val;
+  }
+  return 'N/A';
 }
 
 // Lines that are labels/nav — never treated as values
@@ -181,8 +244,13 @@ async function createUFCExcel() {
   });
   const page = await context.newPage();
 
+  // ── Step 0: Scrape Tapology picks (if URL provided) ────────────────────────
+  const tapologyPicks = TAPOLOGY_EVENT_URL
+    ? await scrapeTapologyPicks(page, TAPOLOGY_EVENT_URL)
+    : null;
+
   // ── Step 1: Load event page and extract all fight IDs ──────────────────────
-  console.log('Loading UFC event page...');
+  console.log('\nLoading UFC event page...');
   await page.goto(UFC_EVENT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(5000);
 
@@ -249,6 +317,7 @@ async function createUFCExcel() {
     { header: 'Money Line',                 key: 'moneyLine',       width: 13 },
     { header: 'Odds Win Prob',              key: 'oddsProb',        width: 14 },
     { header: 'Model Win Prob',             key: 'modelProb',       width: 15 },
+    { header: 'Tapology Picks %',           key: 'tapologyPick',    width: 16 },
     { header: 'Record (W-L-D)',             key: 'record',          width: 15 },
     { header: 'Height',                     key: 'height',          width: 10 },
     { header: 'Reach',                      key: 'reach',           width: 10 },
@@ -327,6 +396,7 @@ async function createUFCExcel() {
         moneyLine:      s.moneyLine      || 'N/A',
         oddsProb:       oddsProb !== null ? `${oddsProb}%` : 'N/A',
         modelProb:      `${modelProb}%`,
+        tapologyPick:   lookupPick(tapologyPicks, name),
         record:         s.record         || 'N/A',
         height:         s.height         || 'N/A',
         reach:          s.reach          || 'N/A',
@@ -344,8 +414,9 @@ async function createUFCExcel() {
       row.eachCell(cell => { cell.alignment = { horizontal: 'center' }; });
       row.getCell('fighter').alignment = { horizontal: 'left' };
       // Subtle background on probability columns
-      row.getCell('oddsProb').fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: probBg } };
-      row.getCell('modelProb').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: probBg } };
+      row.getCell('oddsProb').fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: probBg } };
+      row.getCell('modelProb').fill     = { type: 'pattern', pattern: 'solid', fgColor: { argb: probBg } };
+      row.getCell('tapologyPick').fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: probBg } };
       return row;
     };
 
