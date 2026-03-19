@@ -3,7 +3,12 @@ const { chromium } = require('playwright');
 const { exec } = require('child_process');
 const fs = require('fs');
 
-const UFC_EVENT_URL = 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
+const UFC_EVENT_URL = process.argv[2] || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
+
+function eventUrlToSheetName(url) {
+  const slug = url.split('/').pop(); // e.g. "ufc-fight-night-march-21-2026"
+  return slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).slice(0, 31);
+}
 
 // Lines that are labels/nav — never treated as values
 const NON_VALUES = new Set([
@@ -183,13 +188,28 @@ async function createUFCExcel() {
 
   // Extract all fight data BEFORE clicking expand (clicking hides the name elements)
   const fights = await page.evaluate(() =>
-    [...document.querySelectorAll('.c-listing-fight[data-fmid]')].map((el, idx) => ({
-      fightId:     el.getAttribute('data-fmid'),
-      red:         el.querySelector('.c-listing-fight__corner-name--red')?.innerText.trim(),
-      blue:        el.querySelector('.c-listing-fight__corner-name--blue')?.innerText.trim(),
-      weightClass: el.querySelector('.c-listing-fight__class-text')?.innerText.trim(),
-      idx,
-    }))
+    [...document.querySelectorAll('.c-listing-fight[data-fmid]')].map((el, idx) => {
+      // Walk up the DOM to find the card section heading
+      let card = 'Prelims';
+      let ancestor = el.parentElement;
+      while (ancestor) {
+        const heading = ancestor.querySelector('h2, .l-listing__group-title, .c-card-event--athlete-results__card-name');
+        if (heading) {
+          const text = heading.innerText.trim().toUpperCase();
+          if (text.includes('MAIN')) { card = 'Main Card'; break; }
+          if (text.includes('PRELIM')) { card = 'Prelims'; break; }
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return {
+        fightId:     el.getAttribute('data-fmid'),
+        red:         el.querySelector('.c-listing-fight__corner-name--red')?.innerText.trim(),
+        blue:        el.querySelector('.c-listing-fight__corner-name--blue')?.innerText.trim(),
+        weightClass: el.querySelector('.c-listing-fight__class-text')?.innerText.trim(),
+        card,
+        idx,
+      };
+    })
   );
 
   // Now click expand on the first fight to load its iframe and read the event ID
@@ -213,7 +233,7 @@ async function createUFCExcel() {
     const stats = await scrapeMatchup(page, url);
     results.push({
       ...fight,
-      card:  fight.idx < 6 ? 'Main Card' : 'Prelims',
+      card:  fight.card,
       stats,
     });
   }
@@ -222,7 +242,7 @@ async function createUFCExcel() {
 
   // ── Step 3: Build Excel ─────────────────────────────────────────────────────
   const workbook = new ExcelJS.Workbook();
-  const sheet    = workbook.addWorksheet('UFC Fight Night Mar 21');
+  const sheet    = workbook.addWorksheet(eventUrlToSheetName(UFC_EVENT_URL));
 
   sheet.columns = [
     { header: 'Fighter',                    key: 'fighter',         width: 28 },
