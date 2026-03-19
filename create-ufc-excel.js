@@ -341,8 +341,6 @@ async function createUFCExcel() {
     { header: 'Fighter',                    key: 'fighter',         width: 28 },
     { header: 'Money Line',                 key: 'moneyLine',       width: 13 },
     { header: 'Odds Win Prob',              key: 'oddsProb',        width: 14 },
-    { header: 'Model Win Prob',             key: 'modelProb',       width: 15 },
-    { header: 'Tapology Picks %',           key: 'tapologyPick',    width: 16 },
     { header: 'Record (W-L-D)',             key: 'record',          width: 15 },
     { header: 'Height',                     key: 'height',          width: 10 },
     { header: 'Reach',                      key: 'reach',           width: 10 },
@@ -356,6 +354,8 @@ async function createUFCExcel() {
     { header: 'TD Avg/15min',               key: 'tdAvg',           width: 14 },
     { header: 'TD Accuracy %',              key: 'tdAccuracy',      width: 15 },
     { header: 'TD Defense %',               key: 'tdDefense',       width: 15 },
+    { header: 'Model Win Prob',             key: 'modelProb',       width: 15 },
+    { header: 'Tapology Picks %',           key: 'tapologyPick',    width: 16 },
   ];
 
   const colCount = sheet.columns.length;
