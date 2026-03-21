@@ -155,15 +155,19 @@ async function scrapePredictions(page, url) {
     if (vsMatch && /vs\.?/i.test(line)) {
       const f1 = vsMatch[1].trim();
       const f2 = vsMatch[2].trim();
-      if (f1 && f2) currentFighters = [f1, f2];
+      if (f1 && f2) {
+        currentFighters = [f1, f2];
+        console.log(`  vs found: "${f1}" vs "${f2}"`);
+      }
       continue;
     }
     // Detect pick line: "Best bet: ..." or "Pick: ..."
     const pickMatch = line.match(/(?:best bet|our pick|pick):\s*(.+)/i);
-    if (pickMatch && currentFighters.length === 2) {
+    if (pickMatch) {
       const raw = pickMatch[1].replace(/^[""""]|[""""]$/g, '').trim();
       const summary = formatPick(raw);
-      if (summary) {
+      console.log(`  pick found: "${raw}" → "${summary}" (fighters: ${currentFighters.join(' vs ')})`);
+      if (summary && currentFighters.length === 2) {
         predsMap.set(normName(currentFighters[0]), summary);
         predsMap.set(normName(currentFighters[1]), summary);
         currentFighters = [];
