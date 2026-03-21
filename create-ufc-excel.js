@@ -16,7 +16,9 @@ function normName(name) {
   return (name || '')
     .toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
-    .replace(/[^a-z ]/g, '')
+    .replace(/[\r\n\t]+/g, ' ')  // newlines/tabs → space
+    .replace(/[^a-z ]/g, '')     // remove remaining non-letter chars
+    .replace(/\s+/g, ' ')        // collapse multiple spaces
     .trim();
 }
 
