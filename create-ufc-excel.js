@@ -2,9 +2,11 @@ const ExcelJS = require('exceljs');
 const { chromium } = require('playwright');
 const { exec } = require('child_process');
 const fs = require('fs');
+const Anthropic = require('@anthropic-ai/sdk').default ?? require('@anthropic-ai/sdk');
 
 const UFC_EVENT_URL      = process.argv[2] || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
 const TAPOLOGY_EVENT_URL = process.argv[3] || null;
+const PREDICTIONS_URL    = process.argv[4] || null;
 
 function eventUrlToSheetName(url) {
   const slug = url.split('/').pop(); // e.g. "ufc-fight-night-march-21-2026"
@@ -98,6 +100,62 @@ function lookupPick(picksMap, fullName) {
     if (keyParts[keyParts.length - 1] === lastName) return val;
   }
   return 'N/A';
+}
+
+// Scrape a predictions article and use Claude to extract per-fighter summaries.
+// Returns a Map: normalized-fighter-name → short prediction string (e.g. "Evloev by Dec")
+async function scrapePredictions(page, url) {
+  console.log('\nLoading predictions page...');
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(3000);
+  const articleText = await page.evaluate(() => document.body.innerText);
+
+  console.log('Extracting predictions with Claude...');
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const response = await client.messages.create({
+    model: 'claude-opus-4-6',
+    max_tokens: 1024,
+    messages: [{
+      role: 'user',
+      content: `From this MMA betting article, extract the prediction for every fighter mentioned.
+Return ONLY a valid JSON object mapping each fighter's name (as it appears in the article) to a short prediction summary.
+- For a straight pick, use: "Riley by Dec", "Duncan by KO", "Baraniewski ML"
+- For an over/under prop, use: "Over 2.5 Rds", "Under 1.5 Rds"
+- If the same prop applies to both fighters in a fight, include both as separate keys with the same value.
+- Keep summaries under 20 characters.
+
+Article:
+${articleText.slice(0, 8000)}`,
+    }],
+  });
+
+  let predsMap = new Map();
+  try {
+    const text = response.content[0].text.trim();
+    const json = JSON.parse(text.replace(/^```json\n?|\n?```$/g, ''));
+    for (const [name, pred] of Object.entries(json)) {
+      predsMap.set(normName(name), String(pred));
+    }
+    console.log(`Predictions: extracted ${predsMap.size} entries`);
+    for (const [name, pred] of predsMap) console.log(`  ${name}: ${pred}`);
+  } catch (e) {
+    console.log('Predictions: failed to parse Claude response', e.message);
+  }
+  return predsMap;
+}
+
+// Look up a fighter's prediction, trying full name then last-name fallback
+function lookupPrediction(predsMap, fullName) {
+  if (!predsMap || predsMap.size === 0) return '';
+  const norm = normName(fullName);
+  if (predsMap.has(norm)) return predsMap.get(norm);
+  const parts = norm.split(' ').filter(p => !NAME_SUFFIXES.has(p));
+  const lastName = parts[parts.length - 1];
+  for (const [key, val] of predsMap) {
+    const keyParts = key.split(' ').filter(p => !NAME_SUFFIXES.has(p));
+    if (keyParts[keyParts.length - 1] === lastName) return val;
+  }
+  return '';
 }
 
 // Lines that are labels/nav — never treated as values
@@ -271,9 +329,12 @@ async function createUFCExcel() {
   });
   const page = await context.newPage();
 
-  // ── Step 0: Scrape Tapology picks (if URL provided) ────────────────────────
+  // ── Step 0: Scrape Tapology picks and article predictions (if URLs provided) ─
   const tapologyPicks = TAPOLOGY_EVENT_URL
     ? await scrapeTapologyPicks(page, TAPOLOGY_EVENT_URL)
+    : null;
+  const predictions = PREDICTIONS_URL
+    ? await scrapePredictions(page, PREDICTIONS_URL)
     : null;
 
   // ── Step 1: Load event page and extract all fight IDs ──────────────────────
@@ -358,6 +419,7 @@ async function createUFCExcel() {
     { header: 'TD Defense %',               key: 'tdDefense',       width: 15 },
     { header: 'Model Win Prob',             key: 'modelProb',       width: 15 },
     { header: 'Tapology Picks %',           key: 'tapologyPick',    width: 16 },
+    { header: 'Predictions',               key: 'prediction',      width: 22 },
   ];
 
   const colCount = sheet.columns.length;
@@ -424,6 +486,7 @@ async function createUFCExcel() {
         oddsProb:       oddsProb !== null ? `${oddsProb}%` : 'N/A',
         modelProb:      `${modelProb}%`,
         tapologyPick:   lookupPick(tapologyPicks, name),
+        prediction:     lookupPrediction(predictions, name),
         record:         s.record         || 'N/A',
         height:         s.height         || 'N/A',
         reach:          s.reach          || 'N/A',
