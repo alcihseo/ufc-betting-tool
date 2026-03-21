@@ -337,6 +337,11 @@ async function scrapeMatchup(page, url) {
 }
 
 async function createUFCExcel() {
+  console.log('UFC URL:      ', UFC_EVENT_URL);
+  console.log('Tapology URL: ', TAPOLOGY_EVENT_URL || '(none)');
+  console.log('MMA Mania URL:', PREDICTIONS_URL    || '(none)');
+  console.log('');
+
   // Check if the output file is currently open in Excel (Windows creates a lock file)
   const today = new Date();
   const tag = `${today.getMonth() + 1}-${today.getDate()}-${today.getFullYear()}`;
