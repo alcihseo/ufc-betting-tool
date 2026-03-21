@@ -1,3 +1,4 @@
 node_modules/
 *.xlsx
 *.png
+config.json

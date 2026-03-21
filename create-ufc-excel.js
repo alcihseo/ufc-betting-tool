@@ -3,9 +3,10 @@ const { chromium } = require('playwright');
 const { exec } = require('child_process');
 const fs = require('fs');
 
-const UFC_EVENT_URL      = process.argv[2] || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
-const TAPOLOGY_EVENT_URL = process.argv[3] || null;
-const PREDICTIONS_URL    = process.argv[4] || null;
+const config = fs.existsSync('./config.json') ? JSON.parse(fs.readFileSync('./config.json', 'utf8')) : {};
+const UFC_EVENT_URL      = process.argv[2] || config.ufcEventUrl       || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
+const TAPOLOGY_EVENT_URL = process.argv[3] || config.tapologyUrl       || null;
+const PREDICTIONS_URL    = process.argv[4] || config.mmaManiaPredictionsUrl || null;
 
 function eventUrlToSheetName(url) {
   const slug = url.split('/').pop(); // e.g. "ufc-fight-night-march-21-2026"
