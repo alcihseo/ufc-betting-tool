@@ -55,8 +55,12 @@ async function scrapeTapologyPicks(page, url) {
   const text = await page.evaluate(() => document.body.innerText);
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-  // Find the predictions breakdown section (flexible match)
-  const startIdx = lines.findIndex(l => l.includes('breakdown of event predictions') || l.includes('breakdown of predictions'));
+  // Find the predictions breakdown section (flexible match — text differs pre/post event)
+  const startIdx = lines.findIndex(l =>
+    l.includes('breakdown of event predictions') ||
+    l.includes('breaking down as follows') ||
+    l.includes('total users made predictions')
+  );
   if (startIdx < 0) {
     console.log('Tapology: predictions section not found');
     return new Map();
