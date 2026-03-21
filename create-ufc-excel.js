@@ -2,7 +2,6 @@ const ExcelJS = require('exceljs');
 const { chromium } = require('playwright');
 const { exec } = require('child_process');
 const fs = require('fs');
-const Anthropic = require('@anthropic-ai/sdk').default ?? require('@anthropic-ai/sdk');
 
 const UFC_EVENT_URL      = process.argv[2] || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
 const TAPOLOGY_EVENT_URL = process.argv[3] || null;
@@ -106,45 +105,69 @@ function lookupPick(picksMap, fullName) {
   return 'N/A';
 }
 
-// Scrape a predictions article and use Claude to extract per-fighter summaries.
+// Format a raw pick string into a short summary (e.g. "Evloev by Dec", "Over 2.5 Rds")
+function formatPick(text) {
+  const clean = text.replace(/\s*\([+-]?\d+\)/g, '').trim(); // strip odds
+  const lastWord = s => s.trim().split(/\s+/).pop();
+  const method = m => {
+    const u = m.toUpperCase();
+    if (u.includes('KO') || u.includes('TKO')) return 'KO';
+    if (u.includes('SUB')) return 'Sub';
+    if (u.includes('DEC')) return 'Dec';
+    return m.slice(0, 5);
+  };
+  // Over/Under X rounds
+  const ou = clean.match(/^(over|under)\s+([\d.]+)\s*rounds?/i);
+  if (ou) return `${ou[1][0].toUpperCase() + ou[1].slice(1)} ${ou[2]} Rds`;
+  // [Name] to win by [method]
+  const toWin = clean.match(/^(.+?)\s+to win by\s+(.+)/i);
+  if (toWin) return `${lastWord(toWin[1])} by ${method(toWin[2])}`;
+  // [Name] by [method]
+  const by = clean.match(/^(.+?)\s+by\s+(.+)/i);
+  if (by) return `${lastWord(by[1])} by ${method(by[2])}`;
+  // [Name] moneyline
+  const ml = clean.match(/^(.+?)\s+moneyline/i);
+  if (ml) return `${lastWord(ml[1])} ML`;
+  return clean.slice(0, 20);
+}
+
+// Scrape a predictions article and parse picks via text matching.
 // Returns a Map: normalized-fighter-name → short prediction string (e.g. "Evloev by Dec")
 async function scrapePredictions(page, url) {
   console.log('\nLoading predictions page...');
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(3000);
-  const articleText = await page.evaluate(() => document.body.innerText);
 
-  console.log('Extracting predictions with Claude...');
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const response = await client.messages.create({
-    model: 'claude-opus-4-6',
-    max_tokens: 1024,
-    messages: [{
-      role: 'user',
-      content: `From this MMA betting article, extract the prediction for every fighter mentioned.
-Return ONLY a valid JSON object mapping each fighter's name (as it appears in the article) to a short prediction summary.
-- For a straight pick, use: "Riley by Dec", "Duncan by KO", "Baraniewski ML"
-- For an over/under prop, use: "Over 2.5 Rds", "Under 1.5 Rds"
-- If the same prop applies to both fighters in a fight, include both as separate keys with the same value.
-- Keep summaries under 20 characters.
+  const text = await page.evaluate(() => document.body.innerText);
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-Article:
-${articleText.slice(0, 8000)}`,
-    }],
-  });
+  const predsMap = new Map();
+  let currentFighters = [];
 
-  let predsMap = new Map();
-  try {
-    const text = response.content[0].text.trim();
-    const json = JSON.parse(text.replace(/^```json\n?|\n?```$/g, ''));
-    for (const [name, pred] of Object.entries(json)) {
-      predsMap.set(normName(name), String(pred));
+  for (const line of lines) {
+    // Detect matchup line: "Fighter1 (odds) vs. Fighter2 (odds)"
+    const vsMatch = line.match(/^(.+?)\s*(?:\([+-]?\d+\))?\s*vs\.?\s*(.+?)(?:\s*\([+-]?\d+\))?$/i);
+    if (vsMatch && /vs\.?/i.test(line)) {
+      const f1 = vsMatch[1].trim();
+      const f2 = vsMatch[2].trim();
+      if (f1 && f2) currentFighters = [f1, f2];
+      continue;
     }
-    console.log(`Predictions: extracted ${predsMap.size} entries`);
-    for (const [name, pred] of predsMap) console.log(`  ${name}: ${pred}`);
-  } catch (e) {
-    console.log('Predictions: failed to parse Claude response', e.message);
+    // Detect pick line: "Best bet: ..." or "Pick: ..."
+    const pickMatch = line.match(/(?:best bet|our pick|pick):\s*(.+)/i);
+    if (pickMatch && currentFighters.length === 2) {
+      const raw = pickMatch[1].replace(/^[""""]|[""""]$/g, '').trim();
+      const summary = formatPick(raw);
+      if (summary) {
+        predsMap.set(normName(currentFighters[0]), summary);
+        predsMap.set(normName(currentFighters[1]), summary);
+        currentFighters = [];
+      }
+    }
   }
+
+  console.log(`MMA Mania: found picks for ${predsMap.size} fighters`);
+  for (const [name, pick] of predsMap) console.log(`  ${name}: ${pick}`);
   return predsMap;
 }
 
