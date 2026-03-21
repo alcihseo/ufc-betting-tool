@@ -40,20 +40,24 @@ async function scrapeTapologyPicks(page, url) {
     }
   } catch {}
 
-  // Click the Predictions tab to load pick data
-  try {
-    const predsTab = page.locator('text=Predictions').first();
-    if (await predsTab.isVisible({ timeout: 3000 })) {
-      await predsTab.click();
-      await page.waitForTimeout(2000);
-    }
-  } catch {}
+  // Click the Predictions tab — try multiple possible tab labels
+  const predTabLabels = ['Predictions', 'Community Picks', 'Picks', 'Results'];
+  for (const label of predTabLabels) {
+    try {
+      const tab = page.locator(`text=${label}`).first();
+      if (await tab.isVisible({ timeout: 1500 })) {
+        await tab.click();
+        await page.waitForTimeout(3000);
+        break;
+      }
+    } catch {}
+  }
 
   const text = await page.evaluate(() => document.body.innerText);
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-  // Find the predictions breakdown section
-  const startIdx = lines.findIndex(l => l.includes('current breakdown of event predictions'));
+  // Find the predictions breakdown section (flexible match)
+  const startIdx = lines.findIndex(l => l.includes('breakdown of event predictions') || l.includes('breakdown of predictions'));
   if (startIdx < 0) {
     console.log('Tapology: predictions section not found');
     return new Map();
@@ -419,7 +423,7 @@ async function createUFCExcel() {
     { header: 'TD Defense %',               key: 'tdDefense',       width: 15 },
     { header: 'Model Win Prob',             key: 'modelProb',       width: 15 },
     { header: 'Tapology Picks %',           key: 'tapologyPick',    width: 16 },
-    { header: 'Predictions',               key: 'prediction',      width: 22 },
+    { header: 'MMA Mania Betting Picks',    key: 'prediction',      width: 24 },
   ];
 
   const colCount = sheet.columns.length;
