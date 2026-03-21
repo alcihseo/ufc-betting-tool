@@ -163,7 +163,7 @@ async function scrapePredictions(page, url) {
       continue;
     }
     // Detect matchup line: "Fighter1 (odds) vs. Fighter2 (odds)"
-    const vsMatch = line.match(/^(.+?)\s*(?:\([+-]?\d+\))?\s*vs\.?\s*(.+?)(?:\s*\([+-]?\d+\))?$/i);
+    const vsMatch = line.match(/^(.+?)\s*(?:\([+-]?\d+\))?\s+vs\.?\s+(.+?)(?:\s*\([+-]?\d+\))?$/i);
     if (vsMatch && /vs\.?/i.test(line)) {
       const f1 = vsMatch[1].trim();
       const f2 = vsMatch[2].trim();
