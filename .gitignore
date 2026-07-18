@@ -2,3 +2,5 @@ node_modules/
 *.xlsx
 *.png
 config.json
+.browser-profile/
+tapology-debug.txt

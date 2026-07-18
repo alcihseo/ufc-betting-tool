@@ -1,12 +1,23 @@
 const ExcelJS = require('exceljs');
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());
 const { exec } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 
 const config = fs.existsSync('./config.json') ? JSON.parse(fs.readFileSync('./config.json', 'utf8')) : {};
 const UFC_EVENT_URL      = process.argv[2] || config.ufcEventUrl       || 'https://www.ufc.com/event/ufc-fight-night-march-21-2026';
 const TAPOLOGY_EVENT_URL = process.argv[3] || config.tapologyUrl       || null;
 const PREDICTIONS_URL    = process.argv[4] || config.mmaManiaPredictionsUrl || null;
+const SHERDOG_URLS       = (() => {
+  if (process.argv[5]) return [process.argv[5]];
+  if (config.sherdogUrls) return config.sherdogUrls;
+  if (config.sherdogUrl)  return [config.sherdogUrl];
+  return null;
+})();
+const SHERDOG_BASE       = 'https://www.sherdog.com';
+const MMA_JUNKIE_URL     = process.argv[6] || config.mmaJunkieUrl      || null;
 
 function eventUrlToSheetName(url) {
   const slug = url.split('/').pop(); // e.g. "ufc-fight-night-march-21-2026"
@@ -24,12 +35,82 @@ function normName(name) {
     .trim();
 }
 
+// Read document.body.innerText, retrying while the page is mid-navigation
+// (e.g. ad/consent-driven client-side redirects that briefly null out the body).
+// Each attempt is raced against its own short timeout — a page whose JS thread
+// is wedged by a heavy ad/tracker script can leave page.evaluate() hanging
+// indefinitely, which would otherwise defeat the overall timeoutMs budget below.
+async function getBodyText(page, timeoutMs = 15000, attemptTimeoutMs = 3000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const text = await Promise.race([
+      page.evaluate(() => document.body ? document.body.innerText : null).catch(() => null),
+      new Promise(resolve => setTimeout(() => resolve(null), attemptTimeoutMs)),
+    ]);
+    if (text) return text;
+    await page.waitForTimeout(300);
+  }
+  throw new Error('Page body never settled (stuck mid-navigation, or page JS thread is wedged)');
+}
+
+// Close a throwaway browser without risking the whole script hanging forever.
+// browser.close() waits for the underlying Chrome process to acknowledge a
+// graceful shutdown, which occasionally never happens on ad-heavy sites —
+// seen in practice leaving an orphaned chrome.exe process (and the awaited
+// close() promise pending indefinitely) after MMA Mania/MMA Junkie scraping.
+// Race it against a timeout and force-kill the process if it doesn't close.
+async function closeBrowserSafely(browser, timeoutMs = 10000) {
+  try {
+    await Promise.race([
+      browser.close(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timed out')), timeoutMs)),
+    ]);
+  } catch (e) {
+    console.log(`  (Browser close did not finish in time — force-killing: ${e.message})`);
+    try { browser.process()?.kill('SIGKILL'); } catch {}
+  }
+}
+
 // Scrape community pick % from a Tapology event page.
 // Returns a Map: normalized-fighter-name → pick% string (e.g. "65%")
 async function scrapeTapologyPicks(page, url) {
   console.log('\nLoading Tapology event page...');
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(3000);
+
+  // Wait for Cloudflare / human verification to be completed if it appears.
+  // Detect via the Turnstile challenge iframe (reliable across sites) plus a
+  // broad set of known Cloudflare phrasings — wording varies by site (Tapology
+  // says "verifies you are not a bot" rather than UFC.com's "verify you are human").
+  const CHALLENGE_PHRASES = [
+    'verify you are human',
+    'verifies you are not a bot',
+    'checking if the site connection is secure',
+    'performing security verification',
+    'checking your browser',
+    'please stand by',
+    'attention required',
+  ];
+  const isChallengePage = (phrases) =>
+    !!document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+    document.title.toLowerCase().includes('just a moment') ||
+    phrases.some(p => document.body.innerText.toLowerCase().includes(p));
+  const isClearOfChallenge = (phrases) =>
+    !document.querySelector('iframe[src*="challenges.cloudflare.com"]') &&
+    !document.title.toLowerCase().includes('just a moment') &&
+    !phrases.some(p => document.body.innerText.toLowerCase().includes(p));
+
+  try {
+    const isChallenge = await page.evaluate(isChallengePage, CHALLENGE_PHRASES);
+    if (isChallenge) {
+      console.log('\n>>> Tapology is showing a bot verification. Complete it in the browser window, then wait — the script will continue automatically...');
+      await page.waitForFunction(isClearOfChallenge, CHALLENGE_PHRASES, { timeout: 120000, polling: 500 });
+      console.log('  Verification completed, continuing...');
+      await page.waitForTimeout(2000);
+    }
+  } catch (e) {
+    console.log('  (Verification check timed out or failed — continuing anyway)');
+  }
 
   // Dismiss cookie consent if present
   try {
@@ -53,39 +134,64 @@ async function scrapeTapologyPicks(page, url) {
     } catch {}
   }
 
-  const text = await page.evaluate(() => document.body.innerText);
+  const text = await getBodyText(page);
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
   // Find the predictions breakdown section (flexible match — text differs pre/post event)
   const startIdx = lines.findIndex(l =>
     l.includes('breakdown of event predictions') ||
     l.includes('breaking down as follows') ||
-    l.includes('total users made predictions')
+    l.includes('total users made predictions') ||
+    l.includes('community picks') ||
+    l.includes('users picked') ||
+    l.includes('prediction breakdown')
   );
-  if (startIdx < 0) {
-    console.log('Tapology: predictions section not found');
-    return new Map();
-  }
 
-  // Collect prediction lines, skipping table headers and stop at end marker
-  const SKIP = new Set(['KO/TKO', 'Submission', 'Decision']);
-  const predLines = [];
-  for (let i = startIdx + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (l.startsWith('Update /') || l.startsWith('Verify your')) break;
-    if (SKIP.has(l) || l === ' ') continue;
-    predLines.push(l);
-  }
-
-  // predLines alternates: name, pct%, name, pct%, ...
   const picksMap = new Map();
-  for (let i = 0; i < predLines.length - 1; i++) {
-    const curr = predLines[i];
-    const next = predLines[i + 1];
-    if (!curr.match(/^\d+%$/) && next.match(/^\d+%$/)) {
-      picksMap.set(normName(curr), next);
-      i++; // skip the percentage line we just consumed
+
+  // Extract name/pct% pairs from a slice of lines
+  const SKIP = new Set(['KO/TKO', 'Submission', 'Decision']);
+  function extractPairs(slice) {
+    for (let i = 0; i < slice.length - 1; i++) {
+      const curr = slice[i];
+      const next = slice[i + 1];
+      if (SKIP.has(curr) || curr === ' ') continue;
+      if (!curr.match(/^\d+%$/) && next.match(/^\d+%$/)) {
+        picksMap.set(normName(curr), next);
+        i++;
+      }
     }
+  }
+
+  if (startIdx >= 0) {
+    // Collect prediction lines from the section header onward
+    const predLines = [];
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.startsWith('Update /') || l.startsWith('Verify your')) break;
+      if (SKIP.has(l) || l === ' ') continue;
+      predLines.push(l);
+    }
+    extractPairs(predLines);
+  }
+
+  // Fallback: scan the full page for name/XX% pairs if section header wasn't found
+  // or if the section-based parse found nothing
+  if (picksMap.size === 0) {
+    console.log('Tapology: section header not found (or empty) — trying full-page fallback...');
+    // Save page text for debugging
+    try {
+      fs.writeFileSync('./tapology-debug.txt', lines.join('\n'), 'utf8');
+      console.log('  Debug page text saved to: tapology-debug.txt');
+    } catch {}
+    // Filter to lines that look like fighter names (short, no URLs, not nav labels)
+    const candidateLines = lines.filter(l =>
+      l.length >= 3 && l.length <= 60 &&
+      !l.includes('http') &&
+      !l.includes('@') &&
+      !l.includes('©')
+    );
+    extractPairs(candidateLines);
   }
 
   console.log(`Tapology: found picks for ${picksMap.size} fighters`);
@@ -96,6 +202,29 @@ async function scrapeTapologyPicks(page, url) {
 
 // Look up a fighter's Tapology pick%, trying full name then last name fallback
 const NAME_SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv']);
+
+function levenshtein(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+// Tolerate a 1-letter spelling difference between sites (e.g. Tapology's
+// "Elliott" vs UFC.com's "Elliot") when comparing last names.
+function namesMatch(a, b) {
+  if (a === b) return true;
+  if (a.length < 4 || b.length < 4) return false;
+  return levenshtein(a, b) <= 1;
+}
+
 function lookupPick(picksMap, fullName) {
   if (!picksMap || picksMap.size === 0) return 'N/A';
   const norm = normName(fullName);
@@ -105,7 +234,7 @@ function lookupPick(picksMap, fullName) {
   const lastName = parts[parts.length - 1];
   for (const [key, val] of picksMap) {
     const keyParts = key.split(' ').filter(p => !NAME_SUFFIXES.has(p));
-    if (keyParts[keyParts.length - 1] === lastName) return val;
+    if (namesMatch(keyParts[keyParts.length - 1], lastName)) return val;
   }
   return 'N/A';
 }
@@ -140,10 +269,26 @@ function formatPick(text) {
 // Returns a Map: normalized-fighter-name → short prediction string (e.g. "Evloev by Dec")
 async function scrapePredictions(page, url) {
   console.log('\nLoading predictions page...');
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(3000);
 
-  const text = await page.evaluate(() => document.body.innerText);
+  // SB Nation's ad stack occasionally wedges the page indefinitely (getBodyText
+  // never sees a stable body) — a transient failure, not a permanent one, so a
+  // fresh reload usually clears it. Retry a few times before giving up, since a
+  // single failed attempt used to blank out the whole predictions column.
+  let text;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(2000);
+      text = await getBodyText(page);
+      break;
+    } catch (e) {
+      console.log(`  (MMA Mania load attempt ${attempt}/${maxAttempts} failed: ${e.message})`);
+      if (attempt === maxAttempts) throw e;
+      await page.waitForTimeout(2000);
+    }
+  }
+
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
   const predsMap = new Map();
@@ -163,8 +308,13 @@ async function scrapePredictions(page, url) {
       continue;
     }
     // Detect matchup line: "Fighter1 (odds) vs. Fighter2 (odds)"
+    // Length-gated because the anchored regex below will happily match a whole
+    // prose sentence that merely mentions "vs" in passing (e.g. a reference to
+    // an unrelated fight), which would overwrite the real pairing with garbage
+    // right before the pick line that's supposed to use it.
+    if (line.length > 70) continue;
     const vsMatch = line.match(/^(.+?)\s*(?:\([+-]?\d+\))?\s+vs\.?\s+(.+?)(?:\s*\([+-]?\d+\))?$/i);
-    if (vsMatch && /vs\.?/i.test(line)) {
+    if (vsMatch) {
       const f1 = vsMatch[1].trim();
       const f2 = vsMatch[2].trim();
       if (f1 && f2) currentFighters = [f1, f2];
@@ -185,9 +335,233 @@ function lookupPrediction(predsMap, fullName) {
   const lastName = parts[parts.length - 1];
   for (const [key, val] of predsMap) {
     const keyParts = key.split(' ').filter(p => !NAME_SUFFIXES.has(p));
-    if (keyParts[keyParts.length - 1] === lastName) return val;
+    if (namesMatch(keyParts[keyParts.length - 1], lastName)) return val;
   }
   return '';
+}
+
+// Convert method text to short form
+function sherdogMethodShort(m) {
+  const u = m.toLowerCase();
+  if (u.includes('ko') || u.includes('tko') || u.includes('knockout')) return 'KO';
+  if (u.includes('sub')) return 'Sub';
+  return 'Dec';
+}
+
+// Extract "[name] by [method]" from article lines for a given fight
+function extractSherdogPick(lines, f1, f2) {
+  const getLastName = name => {
+    const parts = normName(name).split(' ').filter(p => !NAME_SUFFIXES.has(p));
+    return parts[parts.length - 1];
+  };
+  const n1 = getLastName(f1), n2 = getLastName(f2);
+  // Match "by" or "via" followed by a finish method
+  const methodRe = /\b(?:by|via)\s+(?:\S+\s+){0,4}(decision|unanimous\s+decision|split\s+decision|majority\s+decision|ko(?:\/tko)?|tko|knockout|submission)\b/gi;
+
+  // Prioritize lines that mention "pick"/"prediction"/"take" — more likely the final verdict
+  const pickLines = lines.filter(l => /\b(?:pick|prediction|taking|i'll go|going with)\b/i.test(l));
+  const searchLines = [...pickLines, ...lines];
+
+  for (const line of searchLines) {
+    const lineLower = line.toLowerCase();
+    // Pattern 1: "[name] ... by/via [method]". A single paragraph often
+    // mentions both fighters and hedges with more than one "by [method]"
+    // phrase before reaching its actual verdict (e.g. "Keith picked X by KO,
+    // but I'm leaning towards decision"), so take the LAST such phrase in the
+    // line and attribute it to whichever fighter's name sits closest
+    // (immediately) before it — not just whichever name appears anywhere
+    // earlier in the paragraph, which previously favored whichever fighter
+    // happened to be listed first regardless of relevance.
+    const matches = [...line.matchAll(methodRe)];
+    if (matches.length > 0) {
+      const mMatch = matches[matches.length - 1];
+      const byIdx = mMatch.index;
+      let bestName = null, bestIdx = -1;
+      for (const name of [n1, n2]) {
+        const nameIdx = lineLower.lastIndexOf(name, byIdx);
+        if (nameIdx !== -1 && nameIdx > bestIdx) { bestIdx = nameIdx; bestName = name; }
+      }
+      if (bestName) {
+        return `${bestName.charAt(0).toUpperCase() + bestName.slice(1)} by ${sherdogMethodShort(mMatch[1])}`;
+      }
+    }
+    // Pattern 2: "[name] wins by/via [method]"
+    for (const name of [n1, n2]) {
+      const wm = line.match(new RegExp(`\\b${name}\\b\\s+wins?\\s+(?:by|via)\\s+([\\w\\s/]+?)(?:\\.|,|$)`, 'i'));
+      if (wm) return `${name.charAt(0).toUpperCase() + name.slice(1)} by ${sherdogMethodShort(wm[1])}`;
+    }
+  }
+  return '';
+}
+
+// Extract picks from a multi-fight page (prelims) by splitting on vs. section headers
+function processSherdogMultiFightPage(lines, picksMap) {
+  const sectionStarts = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.length < 80 && /^.{2,}\s+vs\.?\s+.{2,}$/.test(l) && !/http/i.test(l)) {
+      const m = l.match(/^(.+?)\s+vs\.?\s+(.+?)(?:\s*\(.*\))?$/i);
+      if (m) sectionStarts.push({ idx: i, f1: m[1].trim(), f2: m[2].trim() });
+    }
+  }
+  for (let s = 0; s < sectionStarts.length; s++) {
+    const { idx, f1, f2 } = sectionStarts[s];
+    const end = s + 1 < sectionStarts.length ? sectionStarts[s + 1].idx : lines.length;
+    const pick = extractSherdogPick(lines.slice(idx, end), f1, f2);
+    if (pick) {
+      picksMap.set(normName(f1), pick);
+      picksMap.set(normName(f2), pick);
+      console.log(`  ${f1} vs ${f2}: ${pick}`);
+    }
+  }
+}
+
+// Collect Sherdog preview links from a loaded page (strips fragments, deduplicates via visited set)
+async function collectSherdogLinks(page, visited) {
+  return page.evaluate(({ base, visited: vis }) => {
+    return [...document.querySelectorAll('a[href]')]
+      .map(a => {
+        const href = a.href.startsWith('http') ? a.href : base + a.href;
+        return href.split('#')[0];
+      })
+      .filter(h => /\/news\/articles\//.test(h) && /Preview/i.test(h) && !vis.includes(h));
+  }, { base: SHERDOG_BASE, visited: [...visited] });
+}
+
+// Scrape all Sherdog fight preview pages starting from a main event URL.
+// Follows links from each discovered page (so prelims sub-pages are also crawled).
+async function scrapeSherdogPicks(page, urls) {
+  const picksMap = new Map();
+  console.log('\nLoading Sherdog previews...');
+
+  const visited  = new Set();
+  const queue    = [];
+  for (const url of urls) {
+    const clean = url.split('#')[0];
+    if (!visited.has(clean)) { visited.add(clean); queue.push(clean); }
+  }
+
+  while (queue.length > 0) {
+    const pageUrl = queue.shift();
+    console.log(`  Visiting: ${pageUrl}`);
+
+    try {
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(2000);
+
+      // Discover new preview links on this page and add to queue
+      const newLinks = await collectSherdogLinks(page, visited);
+      for (const link of newLinks) {
+        if (!visited.has(link)) {
+          visited.add(link);
+          queue.push(link);
+        }
+      }
+
+      // Extract picks: try each vs. header against the page's own body content.
+      // Each preview page repeats the SAME "Jump To »" nav menu and "related
+      // articles" sidebar (which mention every fighter on the card, including
+      // ones this particular page never actually discusses), so searching past
+      // that marker risks pairing one fighter's incidental name-drop with a
+      // completely unrelated verdict sentence from a different fight. Truncate
+      // to the actual article body, which always contains its own clean
+      // "Fighter1 (record) vs. Fighter2 (record)" title line to key off of.
+      const text  = await getBodyText(page);
+      const allLines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      const jumpIdx = allLines.findIndex(l => l.startsWith('Jump To'));
+      const lines = jumpIdx >= 0 ? allLines.slice(0, jumpIdx) : allLines;
+      const vsHeaders = lines.filter(l => l.length < 100 && /^.{2,}\s+vs\.?\s+.{2,}$/.test(l) && !/http/i.test(l));
+      const seenPairs = new Set();
+
+      for (const header of vsHeaders) {
+        // Strip ALL parenthetical content (records, weights) before splitting on
+        // "vs" — a fight-title line like "Levi Rodrigues (5-0, 1 NC) vs. Felipe
+        // Franco (10-2)" would otherwise leave "(5-0, 1 NC)" attached to f1, and
+        // since it contains letters ("NC"), normalizing it produces a garbage
+        // "last name" of "nc" that spuriously matches all sorts of words.
+        const cleanHeader = header.replace(/\([^)]*\)/g, '').trim();
+        const hm = cleanHeader.match(/^(.+?)\s+vs\.?\s+(.+?)$/i);
+        if (!hm) continue;
+        const f1 = hm[1].trim(), f2 = hm[2].trim();
+        const key = normName(f1) + '|' + normName(f2);
+        if (seenPairs.has(key)) continue;
+        seenPairs.add(key);
+        if (picksMap.has(normName(f1)) || picksMap.has(normName(f2))) continue;
+        const pick = extractSherdogPick(lines, f1, f2);
+        if (pick) {
+          picksMap.set(normName(f1), pick);
+          picksMap.set(normName(f2), pick);
+          console.log(`    ${f1} vs ${f2}: ${pick}`);
+        }
+      }
+    } catch (e) {
+      console.log(`  (Skipping ${pageUrl} — ${e.message})`);
+    }
+  }
+
+  console.log(`Sherdog: found picks for ${picksMap.size} fighters`);
+  return picksMap;
+}
+
+// Scrape MMA Junkie's staff "Junkie pick results" numbers.
+// Returns a Map: normalized-fighter-name → vote count string (e.g. "6").
+// Main-card fights list results on a separate "Junkie pick results: Name X,
+// Name Y" line below a "Fighter1 vs. Fighter2" header (with Records/Division/
+// Odds lines in between); prelim fights list "Fighter1 vs. Fighter2: Name X,
+// Name Y" (or ": N/A") all on one line. In both cases the two names in the
+// result text are last names only and are NOT guaranteed to appear in the
+// same order as the header (e.g. "Cannonier vs. Duncan" but "Duncan 11,
+// Cannonier 0"), so results are matched to fighters by last name, not position.
+async function scrapeMmaJunkiePicks(page, url) {
+  console.log('\nLoading MMA Junkie picks page...');
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(2000);
+  const text = await getBodyText(page);
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+  const picksMap = new Map();
+  const lastNameOf = name => {
+    const parts = normName(name).split(' ').filter(p => !NAME_SUFFIXES.has(p));
+    return parts[parts.length - 1];
+  };
+  function applyResults(resultsText, fighters) {
+    if (!resultsText || /^n\/a$/i.test(resultsText.trim())) return;
+    for (const part of resultsText.split(',').map(s => s.trim())) {
+      const m = part.match(/^(.+?)\s+(\d+)$/);
+      if (!m) continue;
+      const nickLast = lastNameOf(m[1]);
+      for (const full of fighters) {
+        if (namesMatch(lastNameOf(full), nickLast)) picksMap.set(normName(full), m[2]);
+      }
+    }
+  }
+
+  let currentFighters = [];
+  for (const line of lines) {
+    // Prelims: "Fighter1 vs. Fighter2: results" all on one line
+    const combined = line.match(/^(.+?)\s+vs\.?\s+(.+?):\s*(.+)$/i);
+    if (combined) {
+      applyResults(combined[3], [combined[1].trim(), combined[2].trim()]);
+      continue;
+    }
+    // Main card: apply the most recently seen header to its results line
+    const resultsOnly = line.match(/^Junkie pick results:\s*(.+)$/i);
+    if (resultsOnly) {
+      applyResults(resultsOnly[1], currentFighters);
+      continue;
+    }
+    // Main card header: plain "Fighter1 vs. Fighter2" with no colon/results.
+    // Length-gated to avoid matching longer related-article titles that
+    // happen to mention "X vs. Y" in passing.
+    const header = line.match(/^(.+?)\s+vs\.?\s+(.+)$/i);
+    if (header && line.length < 60) {
+      currentFighters = [header[1].trim(), header[2].trim()];
+    }
+  }
+
+  console.log(`MMA Junkie: found picks for ${picksMap.size} fighters`);
+  for (const [name, val] of picksMap) console.log(`  ${name}: ${val}`);
+  return picksMap;
 }
 
 // Lines that are labels/nav — never treated as values
@@ -258,7 +632,7 @@ function computeModelProb(r, b) {
 
 function cleanLines(text) {
   return text.split('\n').map(l => l.trim()).filter(l =>
-    l.length > 1 &&
+    (l.length > 1 || /^\d$/.test(l)) &&
     !l.includes('Cookie') &&
     !l.includes('clicking') &&
     !l.includes('storing of') &&
@@ -284,7 +658,7 @@ async function scrapeMatchup(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(4000);
 
-  const tabNames = ['MATCHUP STATS', 'WIN BY', 'SIGNIFICANT STRIKES', 'GRAPPLING', 'ODDS'];
+  const tabNames = ['MATCHUP STATS', 'WIN BY', 'SIGNIFICANT STRIKES', 'GRAPPLING'];
   const tabData  = {};
 
   for (const name of tabNames) {
@@ -295,7 +669,7 @@ async function scrapeMatchup(page, url) {
         await page.waitForTimeout(2000);
       }
     } catch {}
-    const text = await page.evaluate(() => document.body.innerText);
+    const text = await getBodyText(page);
     tabData[name] = cleanLines(text);
   }
 
@@ -303,7 +677,6 @@ async function scrapeMatchup(page, url) {
   const w = tabData['WIN BY'];
   const s = tabData['SIGNIFICANT STRIKES'];
   const g = tabData['GRAPPLING'];
-  const o = tabData['ODDS'];
 
   // Parse each stat — structure is always: red_value, LABEL, blue_value
   const record        = findStat(m, 'RECORD');
@@ -319,10 +692,8 @@ async function scrapeMatchup(page, url) {
   const tdAvg         = findStat(g, 'TAKEDOWN AVG', 'PER 15 MIN');
   const tdAccuracy    = findStat(g, 'TAKEDOWN ACCURACY');
   const tdDefense     = findStat(g, 'TAKEDOWN DEFENSE');
-  const moneyLine     = findStat(o, 'MONEY LINE');
 
   const build = side => ({
-    moneyLine:      moneyLine[side],
     record:         record[side],
     height:         height[side],
     reach:          reach[side],
@@ -345,13 +716,17 @@ async function createUFCExcel() {
   console.log('UFC URL:      ', UFC_EVENT_URL);
   console.log('Tapology URL: ', TAPOLOGY_EVENT_URL || '(none)');
   console.log('MMA Mania URL:', PREDICTIONS_URL    || '(none)');
+  console.log('Sherdog URLs: ', SHERDOG_URLS ? SHERDOG_URLS.join(', ') : '(none)');
+  console.log('MMA Junkie URL:', MMA_JUNKIE_URL || '(none)');
   console.log('');
 
   // Check if the output file is currently open in Excel (Windows creates a lock file)
   const today = new Date();
   const tag = `${today.getMonth() + 1}-${today.getDate()}-${today.getFullYear()}`;
-  const outputPath = `C:\\Users\\User\\UFC_FightNight_${tag}.xlsx`;
-  const lockFile   = `C:\\Users\\User\\~$UFC_FightNight_${tag}.xlsx`;
+  const outputDir  = path.join(__dirname, 'output');
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  const outputPath = path.join(outputDir, `UFC_FightNight_${tag}.xlsx`);
+  const lockFile   = path.join(outputDir, `~$UFC_FightNight_${tag}.xlsx`);
 
   if (fs.existsSync(lockFile)) {
     console.error(`\nERROR: UFC_FightNight_${tag}.xlsx is currently open in Excel.`);
@@ -359,10 +734,19 @@ async function createUFCExcel() {
     return;
   }
 
-  const browser = await chromium.launch({ headless: false, args: ['--start-maximized'] });
-  const context = await browser.newContext({
+  // Use a persistent profile so Cloudflare's cf_clearance cookie is saved between runs.
+  // Uses real installed Chrome (not the bundled Chromium) so the binary passes
+  // Cloudflare's integrity checks. Launched via playwright-extra + the puppeteer-extra
+  // stealth plugin, which patches navigator.webdriver and the other fingerprints
+  // Cloudflare Turnstile checks for — the same combo already proven to work
+  // against Cloudflare in the foreclosure-tool project.
+  const PROFILE_DIR = path.join(__dirname, '.browser-profile');
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: false,
+    channel: 'chrome',
+    args: ['--start-maximized'],
     viewport: null,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
   const page = await context.newPage();
 
@@ -370,9 +754,58 @@ async function createUFCExcel() {
   const tapologyPicks = TAPOLOGY_EVENT_URL
     ? await scrapeTapologyPicks(page, TAPOLOGY_EVENT_URL)
     : null;
-  const predictions = PREDICTIONS_URL
-    ? await scrapePredictions(page, PREDICTIONS_URL)
-    : null;
+  let predictions = null;
+  if (PREDICTIONS_URL) {
+    try {
+      // Use a throwaway, non-persistent browser for MMA Mania specifically.
+      // The shared .browser-profile has accumulated some state (most likely
+      // an ad-tracking cookie) that reliably wedges this site's navigation
+      // into a permanent about:blank/loading state, while a clean profile
+      // loads the exact same URL instantly and reliably every time.
+      const freshBrowser = await chromium.launch({ headless: false, channel: 'chrome' });
+      try {
+        const freshContext = await freshBrowser.newContext({
+          viewport: null,
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        });
+        const freshPage = await freshContext.newPage();
+        predictions = await scrapePredictions(freshPage, PREDICTIONS_URL);
+      } finally {
+        await closeBrowserSafely(freshBrowser);
+      }
+    } catch (e) {
+      console.log(`  (MMA Mania predictions failed — skipping: ${e.message})`);
+    }
+  }
+  let sherdogPicks = null;
+  if (SHERDOG_URLS) {
+    try {
+      sherdogPicks = await scrapeSherdogPicks(page, SHERDOG_URLS);
+    } catch (e) {
+      console.log(`  (Sherdog previews failed — skipping: ${e.message})`);
+    }
+  }
+  let mmaJunkiePicks = null;
+  if (MMA_JUNKIE_URL) {
+    try {
+      // Same throwaway-browser approach as MMA Mania — no need to risk the
+      // shared persistent profile on a site it doesn't need Cloudflare
+      // cookies for.
+      const freshBrowser = await chromium.launch({ headless: false, channel: 'chrome' });
+      try {
+        const freshContext = await freshBrowser.newContext({
+          viewport: null,
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        });
+        const freshPage = await freshContext.newPage();
+        mmaJunkiePicks = await scrapeMmaJunkiePicks(freshPage, MMA_JUNKIE_URL);
+      } finally {
+        await closeBrowserSafely(freshBrowser);
+      }
+    } catch (e) {
+      console.log(`  (MMA Junkie picks failed — skipping: ${e.message})`);
+    }
+  }
 
   // ── Step 1: Load event page and extract all fight IDs ──────────────────────
   console.log('\nLoading UFC event page...');
@@ -394,11 +827,16 @@ async function createUFCExcel() {
         }
         ancestor = ancestor.parentElement;
       }
+      // Money line lives on the event listing card itself (.c-listing-fight__odds-row),
+      // not on the /matchup/ sub-page — UFC.com removed the ODDS tab from that page.
+      const oddsAmounts = [...el.querySelectorAll('.c-listing-fight__odds-amount')].map(sp => sp.innerText.trim());
       return {
-        fightId:     el.getAttribute('data-fmid'),
-        red:         el.querySelector('.c-listing-fight__corner-name--red')?.innerText.trim(),
-        blue:        el.querySelector('.c-listing-fight__corner-name--blue')?.innerText.trim(),
-        weightClass: el.querySelector('.c-listing-fight__class-text')?.innerText.trim(),
+        fightId:       el.getAttribute('data-fmid'),
+        red:           el.querySelector('.c-listing-fight__corner-name--red')?.innerText.trim(),
+        blue:          el.querySelector('.c-listing-fight__corner-name--blue')?.innerText.trim(),
+        weightClass:   el.querySelector('.c-listing-fight__class-text')?.innerText.trim(),
+        redMoneyLine:  oddsAmounts[0] || null,
+        blueMoneyLine: oddsAmounts[1] || null,
         card,
         idx,
       };
@@ -424,6 +862,8 @@ async function createUFCExcel() {
     const url = `https://www.ufc.com/matchup/${eventId}/${fight.fightId}/pre`;
     console.log(`[${fight.idx + 1}/${fights.length}] ${fight.red} vs ${fight.blue}`);
     const stats = await scrapeMatchup(page, url);
+    stats.red.moneyLine  = fight.redMoneyLine;
+    stats.blue.moneyLine = fight.blueMoneyLine;
     results.push({
       ...fight,
       card:  fight.card,
@@ -431,7 +871,7 @@ async function createUFCExcel() {
     });
   }
 
-  await browser.close();
+  await context.close();
 
   // ── Step 3: Build Excel ─────────────────────────────────────────────────────
   const workbook = new ExcelJS.Workbook();
@@ -457,6 +897,8 @@ async function createUFCExcel() {
     { header: 'Model Win Prob',             key: 'modelProb',       width: 15 },
     { header: 'Tapology Picks %',           key: 'tapologyPick',    width: 16 },
     { header: 'MMA Mania Betting Picks',    key: 'prediction',      width: 24 },
+    { header: 'Sherdog Previews Picks',     key: 'sherdogPick',     width: 22 },
+    { header: 'MMA Junkie Picks',           key: 'junkiePick',      width: 16 },
   ];
 
   const colCount = sheet.columns.length;
@@ -524,6 +966,8 @@ async function createUFCExcel() {
         modelProb:      `${modelProb}%`,
         tapologyPick:   lookupPick(tapologyPicks, name),
         prediction:     lookupPrediction(predictions, name),
+        sherdogPick:    lookupPrediction(sherdogPicks, name),
+        junkiePick:     lookupPick(mmaJunkiePicks, name),
         record:         s.record         || 'N/A',
         height:         s.height         || 'N/A',
         reach:          s.reach          || 'N/A',
